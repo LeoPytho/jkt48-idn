@@ -1,21 +1,16 @@
 /**
  * IDN LOGIN REST API — untuk Railway
- * Berbasis script Puppeteer yang berhasil
- * 
+ * Pakai @sparticuz/chromium (pre-built, tidak perlu apt install)
+ *
  * Endpoints:
  *   POST /api/idn/send-otp    { email }
  *   POST /api/idn/verify-otp  { email, otp }
  *   GET  /health
- *
- * Deploy ke Railway:
- *   1. Push file ini + package.json ke repo
- *   2. Railway auto-detect Node.js
- *   3. Start command: node idn_api_server.js
  */
 
-const express  = require('express');
-const puppeteer = require('puppeteer');
-const fs       = require('fs');
+const express    = require('express');
+const puppeteer  = require('puppeteer-core');
+const chromium   = require('@sparticuz/chromium');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -30,11 +25,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Session store (bridge send-otp → verify-otp) ────────────────────────────
-// Map: email → { browser, page, captured, createdAt }
+// ─── Session store ────────────────────────────────────────────────────────────
 const sessionStore = new Map();
 
-// Cleanup session expired tiap 5 menit
 setInterval(() => {
   const now = Date.now();
   for (const [email, s] of sessionStore.entries()) {
@@ -46,11 +39,14 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ─── Launch Puppeteer ─────────────────────────────────────────────────────────
+// ─── Launch browser pakai @sparticuz/chromium ─────────────────────────────────
 async function launchBrowser() {
+  const execPath = await chromium.executablePath();
+  console.log('[Browser] executablePath:', execPath);
+
   return await puppeteer.launch({
-    headless: true,
     args: [
+      ...chromium.args,
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
@@ -59,11 +55,13 @@ async function launchBrowser() {
       '--no-zygote',
       '--single-process',
     ],
+    defaultViewport: chromium.defaultViewport,
+    executablePath: execPath,
+    headless: chromium.headless,
   });
 }
 
 // ─── POST /api/idn/send-otp ───────────────────────────────────────────────────
-// Buka browser, isi email, klik Kirim OTP — simpan state browser di sessionStore
 app.post('/api/idn/send-otp', async (req, res) => {
   const { email } = req.body;
 
@@ -86,14 +84,13 @@ app.post('/api/idn/send-otp', async (req, res) => {
 
   let browser = null;
   try {
-    // ── Buka browser ──────────────────────────────────────────────────────────
     console.log('[*] Membuka browser...');
     browser = await launchBrowser();
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // ── Capture semua response penting ───────────────────────────────────────
+    // Capture semua response penting
     const captured = {
       cognitoIDN:    null,
       initiateAuth:  null,
@@ -145,7 +142,7 @@ app.post('/api/idn/send-otp', async (req, res) => {
     const loginUrl =
       'https://connect.idn.media/?client_id=6gnaj30oomhtl0t3qtkfp2uir9&redirect_uri=https://www.idn.app/&authorization_code=ef04562d-89e7-4322-b8ef-86dc4bf49814&state=dU5LvM8nvbI0REKm86t3hPjyXghAWS4m';
 
-    // ── Step 1: Buka halaman login ────────────────────────────────────────────
+    // Step 1: Buka halaman login
     console.log('\n[1] Membuka halaman login...');
     await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await page.waitForSelector('input[name="identity"]', { timeout: 15000 });
@@ -153,7 +150,7 @@ app.post('/api/idn/send-otp', async (req, res) => {
     await page.click('button[type="submit"]');
     console.log('[+] Email diisi, klik Lanjutkan');
 
-    // ── Step 2: Klik Kirim OTP ────────────────────────────────────────────────
+    // Step 2: Klik Kirim OTP
     console.log('\n[2] Menunggu halaman pilihan login...');
     await page.waitForFunction(
       () => document.body.innerText.includes('Kirim OTP'),
@@ -166,7 +163,7 @@ app.post('/api/idn/send-otp', async (req, res) => {
     }
     console.log('[+] Klik Kirim OTP');
 
-    // ── Step 3: Tunggu halaman input OTP ─────────────────────────────────────
+    // Step 3: Tunggu halaman input OTP
     console.log('\n[3] Menunggu halaman input OTP...');
     await page.waitForFunction(
       () => document.body.innerText.includes('Masukkan kode'),
@@ -174,7 +171,7 @@ app.post('/api/idn/send-otp', async (req, res) => {
     );
     console.log('[+] Halaman OTP muncul — OTP dikirim ke:', email);
 
-    // Simpan state browser ke sessionStore
+    // Simpan browser ke session
     sessionStore.set(email, { browser, page, captured, createdAt: Date.now() });
 
     console.log('[IDN] ✅ OTP dikirim ke:', email);
@@ -200,7 +197,6 @@ app.post('/api/idn/send-otp', async (req, res) => {
 });
 
 // ─── POST /api/idn/verify-otp ─────────────────────────────────────────────────
-// Ambil browser dari session, input OTP, verifikasi, capture tokens
 app.post('/api/idn/verify-otp', async (req, res) => {
   const { email, otp } = req.body;
 
@@ -225,8 +221,8 @@ app.post('/api/idn/verify-otp', async (req, res) => {
   const stored = sessionStore.get(email);
   if (!stored) {
     return res.status(400).json({
-      status:  'error',
-      message: `Session tidak ditemukan untuk ${email}. Jalankan send-otp dulu.`,
+      status:    'error',
+      message:   `Session tidak ditemukan untuk ${email}. Jalankan send-otp dulu.`,
       timestamp: new Date().toISOString(),
     });
   }
@@ -234,8 +230,8 @@ app.post('/api/idn/verify-otp', async (req, res) => {
     try { stored.browser?.close(); } catch (_) {}
     sessionStore.delete(email);
     return res.status(400).json({
-      status:  'error',
-      message: 'Session expired (>10 menit). Jalankan send-otp ulang.',
+      status:    'error',
+      message:   'Session expired (>10 menit). Jalankan send-otp ulang.',
       timestamp: new Date().toISOString(),
     });
   }
@@ -243,13 +239,12 @@ app.post('/api/idn/verify-otp', async (req, res) => {
   const { browser, page, captured } = stored;
 
   try {
-    // ── Step 5: Input OTP ke kotak input ─────────────────────────────────────
+    // Step 5: Input OTP
     console.log('\n[5] Memasukkan OTP...');
     const otpInputs = await page.$$('input');
     const otpDigits = String(otp).split('');
 
     if (otpInputs.length >= otpDigits.length) {
-      // Input per digit (kotak terpisah)
       for (let i = 0; i < otpDigits.length; i++) {
         if (otpInputs[i]) {
           await otpInputs[i].click();
@@ -257,12 +252,11 @@ app.post('/api/idn/verify-otp', async (req, res) => {
         }
       }
     } else if (otpInputs.length > 0) {
-      // Satu input untuk semua digit
       await otpInputs[0].click();
       await otpInputs[0].type(String(otp), { delay: 50 });
     }
 
-    // Klik tombol Verifikasi
+    // Klik Verifikasi
     await new Promise((r) => setTimeout(r, 500));
     const allButtons = await page.$$('button');
     for (const btn of allButtons) {
@@ -274,13 +268,13 @@ app.post('/api/idn/verify-otp', async (req, res) => {
       }
     }
 
-    // ── Step 6: Tunggu login selesai & capture tokens ─────────────────────────
+    // Step 6: Tunggu login selesai
     console.log('\n[6] Menunggu login selesai...');
     await new Promise((r) => setTimeout(r, 5000));
 
     // Capture cookies
-    const cookies     = await page.cookies();
-    const important   = ['id_token', 'access_token', 'refresh_token', 'client_id'];
+    const cookies      = await page.cookies();
+    const important    = ['id_token', 'access_token', 'refresh_token', 'client_id'];
     const savedCookies = {};
     cookies.forEach((c) => { if (important.includes(c.name)) savedCookies[c.name] = c.value; });
 
@@ -288,7 +282,7 @@ app.post('/api/idn/verify-otp', async (req, res) => {
 
     const currentUrl = page.url();
 
-    // ── Step 7: Susun data output (format sama dengan script Puppeteer asli) ──
+    // Step 7: Susun output — format sama persis dengan script Puppeteer asli
     const allData = {
       timestamp:  new Date().toISOString(),
       email,
@@ -309,26 +303,20 @@ app.post('/api/idn/verify-otp', async (req, res) => {
       currentUrl,
     };
 
-    // Cek apakah login berhasil (ada token atau redirect ke idn.app)
     const hasTokens = allData.tokens.access_token || allData.tokens.id_token
       || captured.initiateAuth || captured.respondToAuth;
 
     if (!hasTokens && !currentUrl.includes('idn.app')) {
-      throw new Error(`Login tidak berhasil. URL saat ini: ${currentUrl}. OTP mungkin salah.`);
+      throw new Error(`Login tidak berhasil. URL: ${currentUrl}. OTP mungkin salah.`);
     }
 
     console.log('[IDN] ✅ Login berhasil | uuid:', allData.uuid);
     console.log('[IDN] ══════════════════════════════════════════\n');
 
-    // Tutup browser & hapus session
     try { await browser.close(); } catch (_) {}
     sessionStore.delete(email);
 
-    res.json({
-      status:  'success',
-      message: 'Login IDN berhasil',
-      ...allData,
-    });
+    res.json({ status: 'success', message: 'Login IDN berhasil', ...allData });
 
   } catch (error) {
     console.error('[IDN] ❌ Error verify-otp:', error.message);
@@ -345,10 +333,10 @@ app.post('/api/idn/verify-otp', async (req, res) => {
 // ─── GET /health ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
-    status:           'ok',
-    timestamp:        new Date().toISOString(),
-    uptime:           process.uptime(),
-    active_sessions:  sessionStore.size,
+    status:          'ok',
+    timestamp:       new Date().toISOString(),
+    uptime:          process.uptime(),
+    active_sessions: sessionStore.size,
   });
 });
 
@@ -356,30 +344,17 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status:      'success',
-    message:     'IDN Login API is running on Railway',
-    version:     '1.0.0',
+    message:     'IDN Login API — Railway',
+    version:     '2.0.0',
     server_time: new Date().toISOString(),
     endpoints: {
-      'GET  /health':              'Health check',
-      'POST /api/idn/send-otp':    'Kirim OTP ke email  { email }',
-      'POST /api/idn/verify-otp':  'Verifikasi OTP      { email, otp }',
-    },
-    example: {
-      send_otp: {
-        method: 'POST',
-        url:    '/api/idn/send-otp',
-        body:   { email: 'kamu@gmail.com' },
-      },
-      verify_otp: {
-        method: 'POST',
-        url:    '/api/idn/verify-otp',
-        body:   { email: 'kamu@gmail.com', otp: '123456' },
-      },
+      'GET  /health':             'Health check',
+      'POST /api/idn/send-otp':   '{ email }',
+      'POST /api/idn/verify-otp': '{ email, otp }',
     },
   });
 });
 
-// ─── 404 & Error handler ──────────────────────────────────────────────────────
 app.use((req, res) => res.status(404).json({
   status: 'error', message: 'Endpoint not found', path: req.path, timestamp: new Date().toISOString(),
 }));
@@ -388,23 +363,17 @@ app.use((err, req, res, next) => {
   res.status(500).json({ status: 'error', message: 'Internal server error', timestamp: new Date().toISOString() });
 });
 
-// ─── Start server ─────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log('═══════════════════════════════════════════════════════');
   console.log('           🚀 IDN LOGIN API SERVER STARTED 🚀');
   console.log('═══════════════════════════════════════════════════════');
-  console.log(`Port    : ${PORT}`);
-  console.log(`Env     : ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Time    : ${new Date().toISOString()}`);
-  console.log('Endpoints:');
-  console.log('  POST /api/idn/send-otp');
-  console.log('  POST /api/idn/verify-otp');
-  console.log('  GET  /health');
+  console.log(`Port : ${PORT}`);
+  console.log(`Env  : ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Time : ${new Date().toISOString()}`);
   console.log('═══════════════════════════════════════════════════════\n');
 });
 
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM — closing all browser sessions...');
   for (const [, s] of sessionStore.entries()) {
     try { await s.browser?.close(); } catch (_) {}
   }
